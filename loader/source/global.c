@@ -56,6 +56,7 @@ u32 POffset;
 
 NIN_CFG* ncfg = (NIN_CFG*)0x93004000;
 bool UseSD;
+bool UseDisc; //malai40 //If true, will boot directly to disc, not look for games on SD/USB.
 
 const char* const GetRootDevice()
 {

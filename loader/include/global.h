@@ -80,6 +80,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 	((typeof(x))((x) & (~((typeof(x))(align) - 1))))
 
 extern bool UseSD;
+extern bool UseDisc;
 extern u32 POffset;
 extern NIN_CFG *ncfg;
 extern FILE *cfg;

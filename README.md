@@ -1,5 +1,6 @@
-### Nintendont
-A Wii Homebrew Project to play GC Games on Wii and vWii on Wii U
+### Nintendont (Disc-only Fork)
+A Wii Homebrew Project to play GC Games on Wii and vWii on Wii U. 
+This fork adds the option to immediately boot from the Wii disc drive.
 
 ### Features:
 * Works on Wii and Wii U (in vWii mode)
@@ -28,6 +29,8 @@ A Wii Homebrew Project to play GC Games on Wii and vWii on Wii U
 * GBA-Link cable
 * WiiRd
 * Allow use of the Nintendo GameCube Microphone
+* Boot immediately from disc drive with the DISC option on the launch 
+screen (unique to this fork)
 
 ### What Nintendont will never support:
 * Game Boy Player

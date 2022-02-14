@@ -328,181 +328,201 @@ static DevState LoadGameList(gameinfo *gi, u32 sz, u32 *pGameCount)
 		gi[0].Path = strdup("di:di");
 		gamecount++;
 	}
-
-	DIR pdir;
-	snprintf(filename, sizeof(filename), "%s:/games", GetRootDevice());
-	if (f_opendir_char(&pdir, filename) != FR_OK)
-	{
-		// Could not open the "games" directory.
-
-		// Attempt to open the device root.
-		snprintf(filename, sizeof(filename), "%s:/", GetRootDevice());
+	if ( !UseDisc ) //malai40 //Only render a list of games (more than disc drive) if user selected something other than "Disc" load option.
+	{ //malai40
+		DIR pdir;
+		snprintf(filename, sizeof(filename), "%s:/games", GetRootDevice());
 		if (f_opendir_char(&pdir, filename) != FR_OK)
 		{
-			// Could not open the device root.
+			// Could not open the "games" directory.
+
+			// Attempt to open the device root.
+			snprintf(filename, sizeof(filename), "%s:/", GetRootDevice());
+			if (f_opendir_char(&pdir, filename) != FR_OK)
+			{
+				// Could not open the device root.
+				if (pGameCount)
+					*pGameCount = 0;
+				return DEV_NO_OPEN;
+			}
+
+			// Device root opened.
+			// This means the device is usable, but it
+			// doesn't have a "games" directory.
+			f_closedir(&pdir);
 			if (pGameCount)
-				*pGameCount = 0;
-			return DEV_NO_OPEN;
+				*pGameCount = gamecount;
+			return DEV_NO_GAMES;
 		}
 
-		// Device root opened.
-		// This means the device is usable, but it
-		// doesn't have a "games" directory.
+		// Process the directory.
+		// TODO: chdir into /games/?
+		FILINFO fInfo;
+		FIL in;
+		while (f_readdir(&pdir, &fInfo) == FR_OK && fInfo.fname[0] != '\0')
+		{
+			/**
+			 * Game layout should be:
+			 *
+			 * ISO/GCM format:
+			 * - /games/GAMEID/game.gcm
+			 * - /games/GAMEID/game.iso
+			 * - /games/GAMEID/disc2.gcm
+			 * - /games/GAMEID/disc2.iso
+			 * - /games/[anything].gcm
+			 * - /games/[anything].iso
+			 *
+			 * CISO format:
+			 * - /games/GAMEID/game.ciso
+			 * - /games/GAMEID/game.cso
+			 * - /games/GAMEID/disc2.ciso
+			 * - /games/GAMEID/disc2.cso
+			 * - /games/[anything].ciso
+			 *
+			 * FST format:
+			 * - /games/GAMEID/sys/boot.bin plus other files
+			 *
+			 * NOTE: 2-disc games currently only work with the
+			 * subdirectory layout, and the second disc must be
+			 * named either disc2.iso or disc2.gcm.
+			 */
+
+			// Skip "." and "..".
+			// This will also skip "hidden" directories.
+			if (fInfo.fname[0] == '.')
+				continue;
+
+			if (fInfo.fattrib & AM_DIR)
+			{
+				// Subdirectory.
+
+				// Prepare the filename buffer with the directory name.
+				// game.iso/disc2.iso will be appended later.
+				// NOTE: fInfo.fname[] is UTF-16.
+				const char *filename_utf8 = wchar_to_char(fInfo.fname);
+				int fnlen = snprintf(filename, sizeof(filename), "%s:/games/%s/",
+						     GetRootDevice(), filename_utf8);
+
+				//Test if game.iso exists and add to list
+				bool found = false;
+
+				static const char disc_filenames[8][16] = {
+					"game.ciso", "game.cso", "game.gcm", "game.iso",
+					"disc2.ciso", "disc2.cso", "disc2.gcm", "disc2.iso"
+				};
+
+				u32 i;
+				for (i = 0; i < 8; i++)
+				{
+					const u32 discNumber = i / 4;
+
+					// Append the disc filename.
+					strcpy(&filename[fnlen], disc_filenames[i]);
+
+					// Attempt to load disc information.
+					if (IsDiscImageValid(filename, discNumber, &gi[gamecount]))
+					{
+						// Disc image exists and is a GameCube disc.
+						gamecount++;
+						found = true;
+						// Next disc number.
+						i = (discNumber * 4) + 3;
+					}
+				}
+
+				// If none of the expected files were found,
+				// check for FST format.
+				if (!found)
+				{
+					// Read the disc header from boot.bin.
+					memcpy(&filename[fnlen], "sys/boot.bin", 13);
+					if (f_open_char(&in, filename, FA_READ|FA_OPEN_EXISTING) != FR_OK)
+						continue;
+					//gprintf("(%s) ok\n", filename );
+					UINT read;
+					f_read(&in, buf, 0x100, &read);
+					f_close(&in);
+					if (read != 0x100 || !IsGCGame(buf))
+						continue;
+
+					// Read the BI2.bin region code.
+					memcpy(&filename[fnlen], "sys/bi2.bin", 12);
+					if (f_open_char(&in, filename, FA_READ|FA_OPEN_EXISTING) != FR_OK)
+						continue;
+					//gprintf("(%s) ok\n", filename );
+					u32 BI2region;
+					f_lseek(&in, 0x18);
+					f_read(&in, &BI2region, sizeof(BI2region), &read);
+					f_close(&in);
+					if (read != sizeof(BI2region))
+						continue;
+
+					// Terminate the filename at the game's base directory.
+					filename[fnlen] = 0;
+
+					// Make sure the title in the header is NULL terminated.
+					buf[0x20+65] = 0;
+
+					memcpy(gi[gamecount].ID, buf, 6); //ID for EXI
+					gi[gamecount].Revision = 0;
+
+					// TODO: Check titles.txt?
+					gi[gamecount].Name = strdup((const char*)&buf[0x20]);
+					gi[gamecount].Flags = GIFLAG_NAME_ALLOC | GIFLAG_FORMAT_FST | ((BI2region & 3) << 3);
+
+					gi[gamecount].Path = strdup(filename);
+					gamecount++;
+				}
+			}
+			else
+			{
+				// Regular file.
+
+				// Make sure its extension is ".iso" or ".gcm".
+				const char *filename_utf8 = wchar_to_char(fInfo.fname);
+				if (IsSupportedFileExt(filename_utf8))
+				{
+					// Create the full pathname.
+					snprintf(filename, sizeof(filename), "%s:/games/%s",
+						 GetRootDevice(), filename_utf8);
+
+					// Attempt to load disc information.
+					// (NOTE: Only disc 1 is supported right now.)
+					if (IsDiscImageValid(filename, 0, &gi[gamecount]))
+					{
+						// Disc image exists and is a GameCube disc.
+						gamecount++;
+					}
+				}
+			}
+
+			if (gamecount >= sz)	//if array is full
+				break;
+		}
 		f_closedir(&pdir);
+
+		// Sort the list alphabetically.
+		// On Wii, the pseudo-entry for GameCube discs is always
+		// kept at the top.
+		if( gamecount && IsWiiU() && !isWiiVC )
+			qsort(gi, gamecount, sizeof(gameinfo), compare_names);
+		else if( gamecount > 1 )
+			qsort(&gi[1], gamecount-1, sizeof(gameinfo), compare_names);
+
+		// Save the game count.
 		if (pGameCount)
 			*pGameCount = gamecount;
-		return DEV_NO_GAMES;
+
+		if(gamecount == 0)
+			return DEV_NO_TITLES;
+
+		
 	}
-
-	// Process the directory.
-	// TODO: chdir into /games/?
-	FILINFO fInfo;
-	FIL in;
-	while (f_readdir(&pdir, &fInfo) == FR_OK && fInfo.fname[0] != '\0')
-	{
-		/**
-		 * Game layout should be:
-		 *
-		 * ISO/GCM format:
-		 * - /games/GAMEID/game.gcm
-		 * - /games/GAMEID/game.iso
-		 * - /games/GAMEID/disc2.gcm
-		 * - /games/GAMEID/disc2.iso
-		 * - /games/[anything].gcm
-		 * - /games/[anything].iso
-		 *
-		 * CISO format:
-		 * - /games/GAMEID/game.ciso
-		 * - /games/GAMEID/game.cso
-		 * - /games/GAMEID/disc2.ciso
-		 * - /games/GAMEID/disc2.cso
-		 * - /games/[anything].ciso
-		 *
-		 * FST format:
-		 * - /games/GAMEID/sys/boot.bin plus other files
-		 *
-		 * NOTE: 2-disc games currently only work with the
-		 * subdirectory layout, and the second disc must be
-		 * named either disc2.iso or disc2.gcm.
-		 */
-
-		// Skip "." and "..".
-		// This will also skip "hidden" directories.
-		if (fInfo.fname[0] == '.')
-			continue;
-
-		if (fInfo.fattrib & AM_DIR)
-		{
-			// Subdirectory.
-
-			// Prepare the filename buffer with the directory name.
-			// game.iso/disc2.iso will be appended later.
-			// NOTE: fInfo.fname[] is UTF-16.
-			const char *filename_utf8 = wchar_to_char(fInfo.fname);
-			int fnlen = snprintf(filename, sizeof(filename), "%s:/games/%s/",
-					     GetRootDevice(), filename_utf8);
-
-			//Test if game.iso exists and add to list
-			bool found = false;
-
-			static const char disc_filenames[8][16] = {
-				"game.ciso", "game.cso", "game.gcm", "game.iso",
-				"disc2.ciso", "disc2.cso", "disc2.gcm", "disc2.iso"
-			};
-
-			u32 i;
-			for (i = 0; i < 8; i++)
-			{
-				const u32 discNumber = i / 4;
-
-				// Append the disc filename.
-				strcpy(&filename[fnlen], disc_filenames[i]);
-
-				// Attempt to load disc information.
-				if (IsDiscImageValid(filename, discNumber, &gi[gamecount]))
-				{
-					// Disc image exists and is a GameCube disc.
-					gamecount++;
-					found = true;
-					// Next disc number.
-					i = (discNumber * 4) + 3;
-				}
-			}
-
-			// If none of the expected files were found,
-			// check for FST format.
-			if (!found)
-			{
-				// Read the disc header from boot.bin.
-				memcpy(&filename[fnlen], "sys/boot.bin", 13);
-				if (f_open_char(&in, filename, FA_READ|FA_OPEN_EXISTING) != FR_OK)
-					continue;
-				//gprintf("(%s) ok\n", filename );
-				UINT read;
-				f_read(&in, buf, 0x100, &read);
-				f_close(&in);
-				if (read != 0x100 || !IsGCGame(buf))
-					continue;
-
-				// Read the BI2.bin region code.
-				memcpy(&filename[fnlen], "sys/bi2.bin", 12);
-				if (f_open_char(&in, filename, FA_READ|FA_OPEN_EXISTING) != FR_OK)
-					continue;
-				//gprintf("(%s) ok\n", filename );
-				u32 BI2region;
-				f_lseek(&in, 0x18);
-				f_read(&in, &BI2region, sizeof(BI2region), &read);
-				f_close(&in);
-				if (read != sizeof(BI2region))
-					continue;
-
-				// Terminate the filename at the game's base directory.
-				filename[fnlen] = 0;
-
-				// Make sure the title in the header is NULL terminated.
-				buf[0x20+65] = 0;
-
-				memcpy(gi[gamecount].ID, buf, 6); //ID for EXI
-				gi[gamecount].Revision = 0;
-
-				// TODO: Check titles.txt?
-				gi[gamecount].Name = strdup((const char*)&buf[0x20]);
-				gi[gamecount].Flags = GIFLAG_NAME_ALLOC | GIFLAG_FORMAT_FST | ((BI2region & 3) << 3);
-
-				gi[gamecount].Path = strdup(filename);
-				gamecount++;
-			}
-		}
-		else
-		{
-			// Regular file.
-
-			// Make sure its extension is ".iso" or ".gcm".
-			const char *filename_utf8 = wchar_to_char(fInfo.fname);
-			if (IsSupportedFileExt(filename_utf8))
-			{
-				// Create the full pathname.
-				snprintf(filename, sizeof(filename), "%s:/games/%s",
-					 GetRootDevice(), filename_utf8);
-
-				// Attempt to load disc information.
-				// (NOTE: Only disc 1 is supported right now.)
-				if (IsDiscImageValid(filename, 0, &gi[gamecount]))
-				{
-					// Disc image exists and is a GameCube disc.
-					gamecount++;
-				}
-			}
-		}
-
-		if (gamecount >= sz)	//if array is full
-			break;
-	}
-	f_closedir(&pdir);
-
+	
 	// Sort the list alphabetically.
 	// On Wii, the pseudo-entry for GameCube discs is always
 	// kept at the top.
+	/*
 	if( gamecount && IsWiiU() && !isWiiVC )
 		qsort(gi, gamecount, sizeof(gameinfo), compare_names);
 	else if( gamecount > 1 )
@@ -514,6 +534,7 @@ static DevState LoadGameList(gameinfo *gi, u32 sz, u32 *pGameCount)
 
 	if(gamecount == 0)
 		return DEV_NO_TITLES;
+*/
 
 	return DEV_OK;
 }
@@ -1672,6 +1693,7 @@ static bool UpdateSettingsMenu(MenuCtx *ctx)
  */
 static int SelectGame(void)
 {
+	
 	// Depending on how many games are on the storage device,
 	// this could take a while.
 	ShowLoadingScreen();
@@ -1712,6 +1734,20 @@ static int SelectGame(void)
 			gprintf("No %s FAT device found.\n", s_devType);
 			break;
 		}
+	}
+	
+	//If UseDisc is true, just load the disc and don't bother showing any list of games.
+	if ( UseDisc )
+	{
+		const char* StartChar = gi[0].Path + 3;
+		if (StartChar[0] == ':') {
+			StartChar++;
+		}
+		strncpy(ncfg->GamePath, StartChar, sizeof(ncfg->GamePath));
+		ncfg->GamePath[sizeof(ncfg->GamePath)-1] = 0;
+		memcpy(&(ncfg->GameID), gi[0].ID, 4);
+		DCFlushRange((void*)ncfg, sizeof(NIN_CFG));
+		return 1;
 	}
 
 	// Initialize the menu context.
@@ -1873,22 +1909,32 @@ bool SelectDevAndGame(void)
 	// Select the source device. (SD or USB)
 	bool SaveSettings = false;
 	bool redraw = true;	// Need to draw the menu the first time.
+	UseDisc = true; //malai40
 	while (1)
 	{
 		VIDEO_WaitVSync();
 		FPAD_Update();
 		if(Shutdown)
 			LoaderShutdown();
-
+		
 		if (redraw)
 		{
-			UseSD = (ncfg->Config & NIN_CFG_USB) == 0;
+			UseSD = (ncfg->Config & NIN_CFG_USB) == 0;	
 			PrintInfo();
 			PrintButtonActions("Exit", "Select", NULL, NULL);
-			PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 53 * 6 - 8, MENU_POS_Y + 20 * 6, UseSD ? ARROW_LEFT : "");
-			PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 53 * 6 - 8, MENU_POS_Y + 20 * 7, UseSD ? "" : ARROW_LEFT);
-			PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 47 * 6 - 8, MENU_POS_Y + 20 * 6, " SD  ");
-			PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 47 * 6 - 8, MENU_POS_Y + 20 * 7, "USB  ");
+			if (UseDisc)
+			{
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 54 * 6 - 8, MENU_POS_Y + 20 * 6, ARROW_LEFT);
+			}
+			else
+			{
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 54 * 6 - 8, MENU_POS_Y + 20 * 7, UseSD ? ARROW_LEFT : "");
+				PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 54 * 6 - 8, MENU_POS_Y + 20 * 8, UseSD ? "" : ARROW_LEFT);
+			}
+			
+			PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 47 * 6 - 8, MENU_POS_Y + 20 * 6, "DISC  ");
+			PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 47 * 6 - 8, MENU_POS_Y + 20 * 7, "  SD  ");
+			PrintFormat(DEFAULT_SIZE, BLACK, MENU_POS_X + 47 * 6 - 8, MENU_POS_Y + 20 * 8, " USB  ");
 			redraw = false;
 
 			// Render the screen here to prevent a blank frame
@@ -1911,13 +1957,51 @@ bool SelectDevAndGame(void)
 		}
 		else if (FPAD_Down(0))
 		{
-			ncfg->Config = ncfg->Config | NIN_CFG_USB;
-			redraw = true;
+			//If cursor was on Disc, go to SD:
+			if (UseDisc & UseSD)
+			{
+				//ncfg->Config = ncfg->Config & ~NIN_CFG_USB; //Turn SD to On
+				UseDisc = false; //malai40
+				redraw = true;
+			}
+			//If cursor was on SD, go to USB:
+			else if (!UseDisc & UseSD)
+			{
+				ncfg->Config = ncfg->Config | NIN_CFG_USB; //Turn SD to Off
+				//UseDisc = false; //malai40
+				redraw = true;
+			}
+
+			//If cursor was on USB, loop back to Disc? Original program doesn't loop list.
+			//DO NOT implement list looping until figure out how to get up/down press less sensitive.
+			// //Right now you have to use the lightest touch, otherwise the cursor goes all the way 
+			// //to the top or bottom of the list.
+			
 		}
 		else if (FPAD_Up(0))
 		{
-			ncfg->Config = ncfg->Config & ~NIN_CFG_USB;
-			redraw = true;
+			//If cursor was on SD, go to Disc:
+			//if (UseSD & !UseDisc)
+			if (!UseDisc & UseSD)
+			{
+				//ncfg->Config = ncfg->Config | NIN_CFG_USB; //turn SD to Off
+				UseDisc = true; //malai40
+				redraw = true;
+			}
+			//If cursor was on USB, go to SD:
+			//else if (!UseSD & !UseDisc)
+			else if (!UseDisc & !UseSD)
+			{
+				ncfg->Config = ncfg->Config & ~NIN_CFG_USB; //Turn SD to On
+				//UseDisc = false; //malai40
+				redraw = true;
+			}
+			
+			//If cursor was on Disc, loop back to USB? Original program doesn't loop list.
+			//DO NOT implement list looping until figure out how to get up/down press less sensitive.
+			// //Right now you have to use the lightest touch, otherwise the cursor goes all the way 
+			// //to the top or bottom of the list.
+			
 		}
 	}
 
